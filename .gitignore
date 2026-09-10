@@ -12,6 +12,7 @@ dist
 dist-ssr
 src-tauri/target
 *.local
+TokenScope-绿色免安装版/
 
 # Editor directories and files
 .vscode/*
