@@ -2027,6 +2027,19 @@ function ModelModal({
   );
 }
 
+const extractErrorMessage = (err: unknown): string => {
+  if (!err) return "检查更新失败，请确认网络连接";
+  if (typeof err === "string") return err;
+  if (typeof err === "object" && err !== null) {
+    const obj = err as { message?: unknown; error?: unknown; code?: unknown };
+    if (typeof obj.message === "string" && obj.message.trim()) return obj.message;
+    if (typeof obj.error === "string" && obj.error.trim()) return obj.error;
+    if (typeof obj.code === "string" && obj.code.trim()) return `更新检查异常 (${obj.code})`;
+  }
+  if (err instanceof Error && err.message) return err.message;
+  return "检查更新出现异常，请稍后重试";
+};
+
 function UpdateModal({
   onClose,
   onToast,
@@ -2050,8 +2063,7 @@ function UpdateModal({
       const info = await nativeCheckAppUpdate();
       setUpdateInfo(info);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setError(msg || "检查更新失败，请确认网络连接");
+      setError(extractErrorMessage(err));
     } finally {
       setLoading(false);
     }

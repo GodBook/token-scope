@@ -925,26 +925,22 @@ mod commands {
         size: u64,
     }
 
-    #[tauri::command]
-    pub async fn check_app_update(app: tauri::AppHandle) -> AppResult<UpdateInfo> {
-        let current_version = app.package_info().version.to_string();
-        let url = "https://api.github.com/repos/GodBook/token-scope/releases/latest";
-        let client = reqwest::Client::builder()
-            .user_agent("TokenScope-Desktop")
-            .build()
-            .map_err(|e| AppError::new("NETWORK_ERROR", format!("创建请求客户端失败: {e}")))?;
-
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| AppError::new("NETWORK_ERROR", format!("检查更新失败，请检查网络: {e}")))?;
-
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(UpdateInfo {
+    async fn check_update_via_atom(
+        client: &reqwest::Client,
+        current_version: &str,
+    ) -> Option<UpdateInfo> {
+        let atom_url = "https://github.com/GodBook/token-scope/releases.atom";
+        let resp = client.get(atom_url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body = resp.text().await.ok()?;
+        if !body.contains("<entry>") {
+            // 当前仓库尚未发布任何 Release
+            return Some(UpdateInfo {
                 has_update: false,
-                current_version: current_version.clone(),
-                latest_version: current_version,
+                current_version: current_version.to_string(),
+                latest_version: current_version.to_string(),
                 release_name: "当前已是最新版本".to_string(),
                 release_notes: "当前 GitHub 仓库暂无新版本发布。".to_string(),
                 release_date: "".to_string(),
@@ -955,51 +951,122 @@ mod commands {
             });
         }
 
-        if !response.status().is_success() {
-            return Err(AppError::new(
-                "API_ERROR",
-                format!("GitHub API 响应异常: HTTP {}", response.status()),
-            ));
-        }
+        let title_start = body.find("<entry>")?;
+        let entry_slice = &body[title_start..];
+        let t_start = entry_slice.find("<title>")? + 7;
+        let t_end = entry_slice.find("</title>")?;
+        let raw_title = &entry_slice[t_start..t_end];
+        let tag = raw_title.trim();
+        let clean_tag = tag.trim_start_matches(|c| c == 'v' || c == 'V');
+        let has_update = is_newer_version(current_version, clean_tag);
 
-        let release = response
-            .json::<GitHubRelease>()
-            .await
-            .map_err(|e| AppError::new("PARSE_ERROR", format!("解析版本信息失败: {e}")))?;
-
-        let clean_tag = release
-            .tag_name
-            .trim_start_matches(|c| c == 'v' || c == 'V')
-            .to_string();
-        let has_update = is_newer_version(&current_version, &clean_tag);
-
-        let asset = release
-            .assets
-            .iter()
-            .find(|a| a.name.ends_with(".exe") || a.name.ends_with(".msi"))
-            .or_else(|| release.assets.first());
-
-        let (download_url, asset_name, asset_size) = match asset {
-            Some(a) => (
-                Some(a.browser_download_url.clone()),
-                Some(a.name.clone()),
-                Some(a.size),
-            ),
-            None => (None, None, None),
+        let date = if let (Some(d_start), Some(d_end)) =
+            (entry_slice.find("<updated>"), entry_slice.find("</updated>"))
+        {
+            entry_slice[d_start + 9..d_end].to_string()
+        } else {
+            "".to_string()
         };
 
-        Ok(UpdateInfo {
+        let download_url = format!(
+            "https://github.com/GodBook/token-scope/releases/download/{tag}/TokenScope_{clean_tag}_x64-setup.exe"
+        );
+        let asset_name = format!("TokenScope_{clean_tag}_x64-setup.exe");
+
+        Some(UpdateInfo {
             has_update,
-            current_version,
-            latest_version: clean_tag,
-            release_name: release.name.unwrap_or_else(|| release.tag_name.clone()),
-            release_notes: release.body.unwrap_or_default(),
-            release_date: release.published_at.unwrap_or_default(),
-            download_url,
-            asset_name,
-            asset_size,
-            release_url: release.html_url,
+            current_version: current_version.to_string(),
+            latest_version: clean_tag.to_string(),
+            release_name: format!("TokenScope {tag}"),
+            release_notes: "发现新版本发布，点击即可一键无损下载安装升级。".to_string(),
+            release_date: date,
+            download_url: Some(download_url),
+            asset_name: Some(asset_name),
+            asset_size: None,
+            release_url: format!("https://github.com/GodBook/token-scope/releases/tag/{tag}"),
         })
+    }
+
+    #[tauri::command]
+    pub async fn check_app_update(app: tauri::AppHandle) -> AppResult<UpdateInfo> {
+        let current_version = app.package_info().version.to_string();
+        let client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .map_err(|e| AppError::new("NETWORK_ERROR", format!("创建请求客户端失败: {e}")))?;
+
+        // 1. 优先尝试请求 GitHub REST API
+        let api_url = "https://api.github.com/repos/GodBook/token-scope/releases/latest";
+        if let Ok(response) = client
+            .get(api_url)
+            .header("Accept", "application/vnd.github.v3+json")
+            .send()
+            .await
+        {
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(UpdateInfo {
+                    has_update: false,
+                    current_version: current_version.clone(),
+                    latest_version: current_version,
+                    release_name: "当前已是最新版本".to_string(),
+                    release_notes: "当前 GitHub 仓库暂无新版本发布。".to_string(),
+                    release_date: "".to_string(),
+                    download_url: None,
+                    asset_name: None,
+                    asset_size: None,
+                    release_url: "https://github.com/GodBook/token-scope/releases".to_string(),
+                });
+            }
+
+            if response.status().is_success() {
+                if let Ok(release) = response.json::<GitHubRelease>().await {
+                    let clean_tag = release
+                        .tag_name
+                        .trim_start_matches(|c| c == 'v' || c == 'V')
+                        .to_string();
+                    let has_update = is_newer_version(&current_version, &clean_tag);
+
+                    let asset = release
+                        .assets
+                        .iter()
+                        .find(|a| a.name.ends_with(".exe") || a.name.ends_with(".msi"))
+                        .or_else(|| release.assets.first());
+
+                    let (download_url, asset_name, asset_size) = match asset {
+                        Some(a) => (
+                            Some(a.browser_download_url.clone()),
+                            Some(a.name.clone()),
+                            Some(a.size),
+                        ),
+                        None => (None, None, None),
+                    };
+
+                    return Ok(UpdateInfo {
+                        has_update,
+                        current_version,
+                        latest_version: clean_tag,
+                        release_name: release.name.unwrap_or_else(|| release.tag_name.clone()),
+                        release_notes: release.body.unwrap_or_default(),
+                        release_date: release.published_at.unwrap_or_default(),
+                        download_url,
+                        asset_name,
+                        asset_size,
+                        release_url: release.html_url,
+                    });
+                }
+            }
+        }
+
+        // 2. 若 API 遭遇无鉴权速率限制 (403) 或被阻断，自动降级至 Atom Feed 免鉴权通道
+        if let Some(info) = check_update_via_atom(&client, &current_version).await {
+            return Ok(info);
+        }
+
+        Err(AppError::new(
+            "NETWORK_ERROR",
+            "无法连接 GitHub 检查更新，请检查网络或稍后重试",
+        ))
     }
 
     #[tauri::command]
