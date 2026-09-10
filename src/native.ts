@@ -31,3 +31,125 @@ export const nativeDeleteModel = (id: string) => invoke<boolean>("delete_model",
 export const nativeCreateModel = (model: Model) => invoke<NativeModel>("create_model", { name: model.name, provider: model.provider || null, color: model.color || null });
 export const nativeUpdateModel = (model: Model) => invoke<NativeModel>("update_model", { id: model.id, name: model.name, provider: model.provider || null, color: model.color || null });
 export const nativeSetModelActive = (model: Model) => invoke<NativeModel>("set_model_active", { id: model.id, active: model.active });
+
+export type UpdateInfo = {
+  hasUpdate: boolean;
+  currentVersion: string;
+  latestVersion: string;
+  releaseName: string;
+  releaseNotes: string;
+  releaseDate: string;
+  downloadUrl?: string | null;
+  assetName?: string | null;
+  assetSize?: number | null;
+  releaseUrl: string;
+};
+
+export type DownloadProgress = {
+  percentage: number;
+  downloaded: number;
+  total: number;
+};
+
+export type BackupResult = {
+  success: boolean;
+  backupPath: string;
+  message: string;
+};
+
+export type AppMetadata = {
+  version: string;
+  appDataDir: string;
+  databasePath: string;
+  backupCount: number;
+};
+
+export const nativeCheckAppUpdate = async (): Promise<UpdateInfo> => {
+  if (!isNativeDesktop()) {
+    try {
+      const res = await fetch("https://api.github.com/repos/GodBook/token-scope/releases/latest");
+      if (res.status === 404) {
+        return {
+          hasUpdate: false,
+          currentVersion: "0.1.0",
+          latestVersion: "0.1.0",
+          releaseName: "暂无发布记录",
+          releaseNotes: "当前 GitHub 仓库尚未创建任何 Release 发布版本。",
+          releaseDate: "",
+          releaseUrl: "https://github.com/GodBook/token-scope/releases",
+        };
+      }
+      if (res.ok) {
+        const data = await res.json();
+        const tag = (data.tag_name || "").replace(/^[vV]/, "");
+        const asset = data.assets?.find((a: { name: string }) => a.name.endsWith(".exe") || a.name.endsWith(".msi")) || data.assets?.[0];
+        return {
+          hasUpdate: tag !== "0.1.0" && tag !== "",
+          currentVersion: "0.1.0",
+          latestVersion: tag || "0.1.0",
+          releaseName: data.name || data.tag_name || "最新版本",
+          releaseNotes: data.body || "",
+          releaseDate: data.published_at || "",
+          downloadUrl: asset?.browser_download_url,
+          assetName: asset?.name,
+          assetSize: asset?.size,
+          releaseUrl: data.html_url || "https://github.com/GodBook/token-scope/releases",
+        };
+      }
+    } catch {
+      // ignore
+    }
+    return {
+      hasUpdate: false,
+      currentVersion: "0.1.0",
+      latestVersion: "0.1.0",
+      releaseName: "当前版本已是最新",
+      releaseNotes: "当前运行在浏览器预览模式下。",
+      releaseDate: "",
+      releaseUrl: "https://github.com/GodBook/token-scope/releases",
+    };
+  }
+  return invoke<UpdateInfo>("check_app_update");
+};
+
+export const nativeDownloadAndInstallUpdate = async (downloadUrl: string, assetName: string): Promise<string> => {
+  if (!isNativeDesktop()) {
+    window.open(downloadUrl, "_blank");
+    return "已在浏览器中打开下载链接";
+  }
+  return invoke<string>("download_and_install_update", { downloadUrl, assetName });
+};
+
+export const nativeBackupDatabaseNow = async (): Promise<BackupResult> => {
+  if (!isNativeDesktop()) {
+    return { success: true, backupPath: "localStorage", message: "预览模式数据已存储在浏览器缓存中" };
+  }
+  return invoke<BackupResult>("backup_database_now");
+};
+
+export const nativeGetAppInfo = async (): Promise<AppMetadata> => {
+  if (!isNativeDesktop()) {
+    return {
+      version: "0.1.0",
+      appDataDir: "浏览器本地环境 (localStorage)",
+      databasePath: "localStorage:token_scope_data",
+      backupCount: 0,
+    };
+  }
+  return invoke<AppMetadata>("get_app_info");
+};
+
+export const listenUpdateProgress = (callback: (progress: DownloadProgress) => void) => {
+  if (!isNativeDesktop()) return () => {};
+  let unlistenFn: (() => void) | null = null;
+  import("@tauri-apps/api/event").then(({ listen }) => {
+    listen<DownloadProgress>("update-download-progress", (event) => {
+      callback(event.payload);
+    }).then((fn) => {
+      unlistenFn = fn;
+    });
+  });
+  return () => {
+    if (unlistenFn) unlistenFn();
+  };
+};

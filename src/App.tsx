@@ -9,16 +9,20 @@ import {
   CircleHelp,
   Database,
   Download,
+  ExternalLink,
   FileSpreadsheet,
   Filter,
+  HardDriveDownload,
   LayoutDashboard,
   Menu,
   Moon,
   MoreHorizontal,
   Pencil,
   Plus,
+  RefreshCw,
   Search,
   Settings,
+  ShieldCheck,
   SlidersHorizontal,
   Sun,
   Trash2,
@@ -47,14 +51,22 @@ import {
 import { exportWorkbook } from "./export";
 import {
   isNativeDesktop,
+  listenUpdateProgress,
   loadNativeData,
+  nativeBackupDatabaseNow,
+  nativeCheckAppUpdate,
   nativeCreateModel,
   nativeDeleteModel,
   nativeDeleteRecord,
+  nativeDownloadAndInstallUpdate,
+  nativeGetAppInfo,
   nativeSaveRecord,
   nativeSaveUsageRecordsBatch,
   nativeSetModelActive,
   nativeUpdateModel,
+  type AppMetadata,
+  type DownloadProgress,
+  type UpdateInfo,
 } from "./native";
 import type {
   AppData,
@@ -148,6 +160,8 @@ function App() {
     record?: UsageRecord;
   } | null>(null);
   const [modelModal, setModelModal] = useState<{ model?: Model } | null>(null);
+  const [updateModalOpen, setUpdateModalOpen] = useState(false);
+  const [hasNewVersion, setHasNewVersion] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
 
@@ -159,6 +173,16 @@ function App() {
     loadNativeData()
       .then(setData)
       .catch(() => setToast("本地数据库暂时无法读取，已使用预览数据"));
+  }, []);
+  useEffect(() => {
+    // 启动时在后台静默检查一次是否有新版本
+    nativeCheckAppUpdate()
+      .then((info) => {
+        if (info.hasUpdate) {
+          setHasNewVersion(true);
+        }
+      })
+      .catch(() => {});
   }, []);
   useEffect(() => {
     if (!toast) return;
@@ -415,12 +439,25 @@ function App() {
           </div>
           <button
             className="nav-item muted"
-            onClick={() => setToast("设置功能将在下一版本开放")}
+            onClick={() => setUpdateModalOpen(true)}
+            style={{ position: "relative" }}
           >
             <Settings size={18} />
-            <span>设置</span>
+            <span>设置与更新</span>
+            {hasNewVersion && <span className="update-dot" style={{ marginLeft: "auto" }} />}
           </button>
-          <div className="app-version">v0.1.0 · Windows 桌面版</div>
+          <button
+            className="app-version-btn"
+            onClick={() => setUpdateModalOpen(true)}
+            title="点击检查更新"
+          >
+            <span>v0.1.0 · Windows 桌面版</span>
+            {hasNewVersion ? (
+              <span className="update-dot" title="有新版本可用" />
+            ) : (
+              <span style={{ textDecoration: "underline", opacity: 0.75 }}>检查更新</span>
+            )}
+          </button>
         </div>
       </aside>
       <main className="main-content">
@@ -549,6 +586,12 @@ function App() {
           model={modelModal.model}
           onClose={() => setModelModal(null)}
           onSave={handleSaveModel}
+        />
+      )}
+      {updateModalOpen && (
+        <UpdateModal
+          onClose={() => setUpdateModalOpen(false)}
+          onToast={setToast}
         />
       )}
       {toast && (
@@ -1984,12 +2027,315 @@ function ModelModal({
   );
 }
 
+function UpdateModal({
+  onClose,
+  onToast,
+}: {
+  onClose: () => void;
+  onToast: (message: string) => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [appInfo, setAppInfo] = useState<AppMetadata | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const [progress, setProgress] = useState<DownloadProgress | null>(null);
+  const [backingUp, setBackingUp] = useState(false);
+  const [updateResult, setUpdateResult] = useState<string | null>(null);
+
+  const handleCheck = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const info = await nativeCheckAppUpdate();
+      setUpdateInfo(info);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(msg || "检查更新失败，请确认网络连接");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    nativeGetAppInfo().then(setAppInfo).catch(() => {});
+    handleCheck();
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listenUpdateProgress((p) => {
+      setProgress(p);
+    });
+    return () => {
+      unlisten();
+    };
+  }, []);
+
+  const handleBackupNow = async () => {
+    setBackingUp(true);
+    try {
+      const res = await nativeBackupDatabaseNow();
+      onToast(res.message);
+      nativeGetAppInfo().then(setAppInfo).catch(() => {});
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      onToast(`备份失败: ${msg}`);
+    } finally {
+      setBackingUp(false);
+    }
+  };
+
+  const handleStartUpdate = async () => {
+    if (!updateInfo?.downloadUrl || !updateInfo?.assetName) {
+      if (updateInfo?.releaseUrl) {
+        window.open(updateInfo.releaseUrl, "_blank");
+      }
+      return;
+    }
+    setDownloading(true);
+    setError(null);
+    try {
+      const res = await nativeDownloadAndInstallUpdate(
+        updateInfo.downloadUrl,
+        updateInfo.assetName,
+      );
+      setUpdateResult(res);
+      onToast("安装包已就绪并拉起！您的本地数据已自动备份完好。");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(`更新安装失败: ${msg}`);
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  return (
+    <Modal title="软件更新与数据管理" className="update-modal" onClose={onClose}>
+      <div className="update-modal-body">
+        <div className="update-header-info">
+          <div>
+            <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 4 }}>
+              当前运行版本
+            </div>
+            <div className="version-badge">
+              TokenScope v{appInfo?.version || "0.1.0"}
+            </div>
+          </div>
+          <button
+            className="button secondary"
+            style={{ height: 32, padding: "0 10px", fontSize: 10 }}
+            onClick={handleCheck}
+            disabled={loading || downloading}
+          >
+            <RefreshCw size={13} className={loading ? "spin" : ""} />
+            <span>{loading ? "正在检查..." : "检查更新"}</span>
+          </button>
+        </div>
+
+        {error && (
+          <div
+            className="form-error"
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+            }}
+          >
+            <span>{error}</span>
+            <button
+              className="button secondary"
+              style={{ height: 26, padding: "0 8px", fontSize: 9 }}
+              onClick={handleCheck}
+            >
+              重试
+            </button>
+          </div>
+        )}
+
+        {loading && !updateInfo && (
+          <div className="empty-chart" style={{ height: 110 }}>
+            <div style={{ color: "var(--amber)" }}>
+              <RefreshCw size={22} className="spin" />
+            </div>
+            <span>正在连接 GitHub 检查最新版本...</span>
+          </div>
+        )}
+
+        {updateInfo && !updateInfo.hasUpdate && (
+          <div className="update-status-card">
+            <div className="update-tag-line">
+              <span className="badge-latest">✓ 当前已是最新版</span>
+              <span>v{updateInfo.currentVersion} 暂无可用新版本</span>
+            </div>
+            <div style={{ fontSize: 11, color: "var(--muted)", lineHeight: 1.5 }}>
+              {updateInfo.releaseNotes || "您正在使用的是最新发布的版本，本地数据库与历史记录完好无损。"}
+            </div>
+            {updateInfo.releaseUrl && (
+              <div style={{ paddingTop: 4 }}>
+                <a
+                  href={updateInfo.releaseUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-button"
+                  style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
+                >
+                  <span>访问 GitHub 仓库 Release 发布页</span>
+                  <ExternalLink size={12} />
+                </a>
+              </div>
+            )}
+          </div>
+        )}
+
+        {updateInfo && updateInfo.hasUpdate && (
+          <div className="update-status-card has-update">
+            <div className="update-tag-line">
+              <span className="badge-new">发现新版本</span>
+              <span>
+                v{updateInfo.latestVersion}{" "}
+                {updateInfo.releaseName ? `· ${updateInfo.releaseName}` : ""}
+              </span>
+            </div>
+
+            {updateInfo.releaseDate && (
+              <div style={{ fontSize: 10, color: "var(--subtle)" }}>
+                发布日期：{updateInfo.releaseDate.slice(0, 10)}
+              </div>
+            )}
+
+            {updateInfo.releaseNotes && (
+              <div>
+                <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 4 }}>
+                  更新说明：
+                </div>
+                <div className="update-notes-box">{updateInfo.releaseNotes}</div>
+              </div>
+            )}
+
+            <div className="data-safety-banner">
+              <ShieldCheck size={20} style={{ flexShrink: 0, marginTop: 1 }} />
+              <div>
+                <strong>数据安全保证（不删除任何数据）</strong>
+                <span>
+                  本次升级采用无损更新机制，SQLite 历史数据存放在系统 AppData 目录，不受程序替换影响；启动安装前系统还将自动建立数据库备份快照。
+                </span>
+              </div>
+            </div>
+
+            {downloading && progress && (
+              <div className="update-progress-bar-wrap">
+                <div className="update-progress-text">
+                  <span>正在下载更新包...</span>
+                  <span>{progress.percentage.toFixed(1)}%</span>
+                </div>
+                <div className="update-progress-bar">
+                  <div
+                    className="update-progress-fill"
+                    style={{ width: `${progress.percentage}%` }}
+                  />
+                </div>
+                <div className="update-progress-text" style={{ fontSize: 9 }}>
+                  <span>已下载 {(progress.downloaded / 1024 / 1024).toFixed(2)} MB</span>
+                  <span>
+                    总计{" "}
+                    {progress.total > 0
+                      ? `${(progress.total / 1024 / 1024).toFixed(2)} MB`
+                      : "计算中"}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {updateResult ? (
+              <div
+                style={{
+                  padding: "10px 12px",
+                  background: "#edf7f3",
+                  border: "1px solid #ccebdb",
+                  borderRadius: 6,
+                  color: "#276749",
+                  fontSize: 11,
+                  lineHeight: 1.5,
+                }}
+              >
+                {updateResult}
+              </div>
+            ) : (
+              <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 4 }}>
+                {updateInfo.downloadUrl ? (
+                  <button
+                    className="button primary"
+                    style={{ flex: 1, height: 38 }}
+                    onClick={handleStartUpdate}
+                    disabled={downloading}
+                  >
+                    <HardDriveDownload size={15} />
+                    <span>
+                      {downloading ? "正在下载更新包..." : "一键点击更新（无损保留数据）"}
+                    </span>
+                  </button>
+                ) : (
+                  <a
+                    href={updateInfo.releaseUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="button primary"
+                    style={{ flex: 1, textDecoration: "none", height: 38 }}
+                  >
+                    <ExternalLink size={14} />
+                    <span>前往 GitHub Release 页面下载</span>
+                  </a>
+                )}
+                {updateInfo.downloadUrl && (
+                  <a
+                    href={updateInfo.releaseUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="button secondary"
+                    style={{ height: 38, textDecoration: "none" }}
+                    title="在浏览器中查看 Release"
+                  >
+                    <ExternalLink size={14} />
+                  </a>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="backup-section">
+          <div>
+            <strong>本地数据存储与安全</strong>
+            <span>
+              数据库位置：
+              {appInfo?.databasePath
+                ? appInfo.databasePath.split("\\").slice(-2).join("\\")
+                : "AppData"}
+              {appInfo?.backupCount ? ` · 已有 ${appInfo.backupCount} 个历史快照` : ""}
+            </span>
+          </div>
+          <button
+            className="button secondary"
+            style={{ height: 30, padding: "0 10px", fontSize: 10 }}
+            onClick={handleBackupNow}
+            disabled={backingUp}
+          >
+            <span>{backingUp ? "备份中..." : "手动创建数据备份"}</span>
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 const Modal = ({
   title,
+  className = "",
   onClose,
   children,
 }: {
   title: string;
+  className?: string;
   onClose: () => void;
   children: React.ReactNode;
 }) => (
@@ -2000,7 +2346,7 @@ const Modal = ({
       if (event.target === event.currentTarget) onClose();
     }}
   >
-    <div className="modal" role="dialog" aria-modal="true" aria-label={title}>
+    <div className={`modal ${className}`} role="dialog" aria-modal="true" aria-label={title}>
       <div className="modal-header">
         <h2>{title}</h2>
         <button className="icon-button" onClick={onClose} aria-label="关闭">

@@ -2,7 +2,7 @@ use chrono::{Duration, Local, NaiveDate, Utc};
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Mutex};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use uuid::Uuid;
 
 const DATABASE_FILE: &str = "token-statistics.sqlite";
@@ -145,6 +145,93 @@ pub struct Stats {
     pub active_model_count: i64,
     pub daily: Vec<DailyStats>,
     pub by_model: Vec<ModelStats>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    pub has_update: bool,
+    pub current_version: String,
+    pub latest_version: String,
+    pub release_name: String,
+    pub release_notes: String,
+    pub release_date: String,
+    pub download_url: Option<String>,
+    pub asset_name: Option<String>,
+    pub asset_size: Option<u64>,
+    pub release_url: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadProgress {
+    pub percentage: f64,
+    pub downloaded: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupResult {
+    pub success: bool,
+    pub backup_path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AppMetadata {
+    pub version: String,
+    pub app_data_dir: String,
+    pub database_path: String,
+    pub backup_count: usize,
+}
+
+fn parse_version_digits(v: &str) -> Vec<u64> {
+    let clean = v.trim().trim_start_matches(|c| c == 'v' || c == 'V');
+    clean
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
+}
+
+pub fn is_newer_version(current: &str, candidate: &str) -> bool {
+    let cur_parts = parse_version_digits(current);
+    let cand_parts = parse_version_digits(candidate);
+    let max_len = cur_parts.len().max(cand_parts.len());
+    for i in 0..max_len {
+        let cur = cur_parts.get(i).copied().unwrap_or(0);
+        let cand = cand_parts.get(i).copied().unwrap_or(0);
+        if cand > cur {
+            return true;
+        } else if cand < cur {
+            return false;
+        }
+    }
+    false
+}
+
+pub fn backup_database_file(data_dir: &Path) -> Result<std::path::PathBuf, AppError> {
+    let db_path = data_dir.join(DATABASE_FILE);
+    if !db_path.exists() {
+        return Ok(db_path);
+    }
+    let backups_dir = data_dir.join("backups");
+    std::fs::create_dir_all(&backups_dir)
+        .map_err(|e| AppError::database(format!("创建备份目录失败: {e}")))?;
+
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let backup_filename = format!("token-statistics-pre-update-{timestamp}.sqlite");
+    let backup_path = backups_dir.join(&backup_filename);
+
+    std::fs::copy(&db_path, &backup_path)
+        .map_err(|e| AppError::database(format!("备份数据库失败: {e}")))?;
+
+    let fixed_bak = data_dir.join("token-statistics.sqlite.bak");
+    let _ = std::fs::copy(&db_path, &fixed_bak);
+
+    Ok(backup_path)
 }
 
 fn now() -> String {
@@ -819,6 +906,247 @@ mod commands {
             by_model,
         })
     }
+
+    #[derive(Debug, Deserialize)]
+    struct GitHubRelease {
+        tag_name: String,
+        name: Option<String>,
+        body: Option<String>,
+        published_at: Option<String>,
+        html_url: String,
+        #[serde(default)]
+        assets: Vec<GitHubAsset>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GitHubAsset {
+        name: String,
+        browser_download_url: String,
+        size: u64,
+    }
+
+    #[tauri::command]
+    pub async fn check_app_update(app: tauri::AppHandle) -> AppResult<UpdateInfo> {
+        let current_version = app.package_info().version.to_string();
+        let url = "https://api.github.com/repos/GodBook/token-scope/releases/latest";
+        let client = reqwest::Client::builder()
+            .user_agent("TokenScope-Desktop")
+            .build()
+            .map_err(|e| AppError::new("NETWORK_ERROR", format!("创建请求客户端失败: {e}")))?;
+
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| AppError::new("NETWORK_ERROR", format!("检查更新失败，请检查网络: {e}")))?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(UpdateInfo {
+                has_update: false,
+                current_version: current_version.clone(),
+                latest_version: current_version,
+                release_name: "当前已是最新版本".to_string(),
+                release_notes: "当前 GitHub 仓库暂无新版本发布。".to_string(),
+                release_date: "".to_string(),
+                download_url: None,
+                asset_name: None,
+                asset_size: None,
+                release_url: "https://github.com/GodBook/token-scope/releases".to_string(),
+            });
+        }
+
+        if !response.status().is_success() {
+            return Err(AppError::new(
+                "API_ERROR",
+                format!("GitHub API 响应异常: HTTP {}", response.status()),
+            ));
+        }
+
+        let release = response
+            .json::<GitHubRelease>()
+            .await
+            .map_err(|e| AppError::new("PARSE_ERROR", format!("解析版本信息失败: {e}")))?;
+
+        let clean_tag = release
+            .tag_name
+            .trim_start_matches(|c| c == 'v' || c == 'V')
+            .to_string();
+        let has_update = is_newer_version(&current_version, &clean_tag);
+
+        let asset = release
+            .assets
+            .iter()
+            .find(|a| a.name.ends_with(".exe") || a.name.ends_with(".msi"))
+            .or_else(|| release.assets.first());
+
+        let (download_url, asset_name, asset_size) = match asset {
+            Some(a) => (
+                Some(a.browser_download_url.clone()),
+                Some(a.name.clone()),
+                Some(a.size),
+            ),
+            None => (None, None, None),
+        };
+
+        Ok(UpdateInfo {
+            has_update,
+            current_version,
+            latest_version: clean_tag,
+            release_name: release.name.unwrap_or_else(|| release.tag_name.clone()),
+            release_notes: release.body.unwrap_or_default(),
+            release_date: release.published_at.unwrap_or_default(),
+            download_url,
+            asset_name,
+            asset_size,
+            release_url: release.html_url,
+        })
+    }
+
+    #[tauri::command]
+    pub async fn download_and_install_update(
+        app: tauri::AppHandle,
+        download_url: String,
+        asset_name: String,
+    ) -> AppResult<String> {
+        use futures_util::StreamExt;
+        use std::io::Write;
+
+        let data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| AppError::new("PATH_ERROR", e.to_string()))?;
+
+        // 1. 保障数据安全：更新前自动创建数据库完整快照
+        let backup_path = backup_database_file(&data_dir)?;
+        let backup_info = if backup_path.exists() {
+            format!("已自动创建数据快照备份至：{}", backup_path.display())
+        } else {
+            "未检测到需要备份的历史数据".to_string()
+        };
+
+        // 2. 准备下载目录与文件
+        let update_dir = std::env::temp_dir().join("token-scope-update");
+        std::fs::create_dir_all(&update_dir)
+            .map_err(|e| AppError::new("FS_ERROR", format!("创建下载目录失败: {e}")))?;
+        let target_file = update_dir.join(&asset_name);
+
+        let client = reqwest::Client::builder()
+            .user_agent("TokenScope-Desktop")
+            .build()
+            .map_err(|e| AppError::new("NETWORK_ERROR", format!("创建客户端失败: {e}")))?;
+
+        let response = client
+            .get(&download_url)
+            .send()
+            .await
+            .map_err(|e| AppError::new("DOWNLOAD_ERROR", format!("发起下载失败: {e}")))?;
+
+        if !response.status().is_success() {
+            return Err(AppError::new(
+                "DOWNLOAD_ERROR",
+                format!("下载失败，HTTP 状态码: {}", response.status()),
+            ));
+        }
+
+        let total_size = response.content_length().unwrap_or(0);
+        let mut file = std::fs::File::create(&target_file)
+            .map_err(|e| AppError::new("FS_ERROR", format!("创建安装包文件失败: {e}")))?;
+
+        let mut stream = response.bytes_stream();
+        let mut downloaded: u64 = 0;
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result
+                .map_err(|e| AppError::new("DOWNLOAD_ERROR", format!("下载传输中断: {e}")))?;
+            file.write_all(&chunk)
+                .map_err(|e| AppError::new("FS_ERROR", format!("写入文件失败: {e}")))?;
+            downloaded += chunk.len() as u64;
+
+            let percentage = if total_size > 0 {
+                (downloaded as f64 / total_size as f64 * 100.0).min(100.0)
+            } else {
+                0.0
+            };
+
+            let _ = app.emit(
+                "update-download-progress",
+                DownloadProgress {
+                    percentage,
+                    downloaded,
+                    total: total_size,
+                },
+            );
+        }
+        file.flush()
+            .map_err(|e| AppError::new("FS_ERROR", format!("写入磁盘失败: {e}")))?;
+
+        // 3. 启动安装程序（Windows 环境下保留 AppData 用户数据无损更新）
+        #[cfg(target_os = "windows")]
+        {
+            if asset_name.ends_with(".msi") {
+                std::process::Command::new("msiexec")
+                    .args(["/i", target_file.to_str().unwrap_or_default()])
+                    .spawn()
+                    .map_err(|e| AppError::new("LAUNCH_FAILED", format!("启动 MSI 安装程序失败: {e}")))?;
+            } else {
+                std::process::Command::new(&target_file)
+                    .spawn()
+                    .map_err(|e| AppError::new("LAUNCH_FAILED", format!("启动安装程序失败: {e}")))?;
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            return Err(AppError::new(
+                "PLATFORM_UNSUPPORTED",
+                "仅 Windows 平台支持自动启动安装包，请手动运行下载的文件",
+            ));
+        }
+
+        Ok(format!(
+            "更新包已就绪并启动安装程序！{}\n您的所有历史 Token 数据均已完好保留。",
+            backup_info
+        ))
+    }
+
+    #[tauri::command]
+    pub fn backup_database_now(app: tauri::AppHandle) -> AppResult<BackupResult> {
+        let data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| AppError::new("PATH_ERROR", e.to_string()))?;
+        let backup_path = backup_database_file(&data_dir)?;
+        Ok(BackupResult {
+            success: true,
+            backup_path: backup_path.display().to_string(),
+            message: format!("数据库已安全备份至：{}", backup_path.display()),
+        })
+    }
+
+    #[tauri::command]
+    pub fn get_app_info(app: tauri::AppHandle) -> AppResult<AppMetadata> {
+        let version = app.package_info().version.to_string();
+        let data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| AppError::new("PATH_ERROR", e.to_string()))?;
+        let db_path = data_dir.join(DATABASE_FILE);
+        let backups_dir = data_dir.join("backups");
+        let backup_count = if backups_dir.exists() {
+            std::fs::read_dir(&backups_dir)
+                .map(|entries| entries.filter_map(|e| e.ok()).count())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        Ok(AppMetadata {
+            version,
+            app_data_dir: data_dir.display().to_string(),
+            database_path: db_path.display().to_string(),
+            backup_count,
+        })
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -850,7 +1178,11 @@ pub fn run() {
             commands::save_usage_records_batch,
             commands::list_usage_records,
             commands::delete_usage_record,
-            commands::query_stats
+            commands::query_stats,
+            commands::check_app_update,
+            commands::download_and_install_update,
+            commands::backup_database_now,
+            commands::get_app_info
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1020,5 +1352,34 @@ mod tests {
             )
             .expect("read overwritten token count");
         assert_eq!(token_count, 2_000_000);
+    }
+
+    #[test]
+    fn version_comparison_works() {
+        assert!(is_newer_version("0.1.0", "0.2.0"));
+        assert!(is_newer_version("0.1.0", "v0.1.1"));
+        assert!(is_newer_version("0.1.0", "0.1.0.1"));
+        assert!(!is_newer_version("0.1.0", "0.1.0"));
+        assert!(!is_newer_version("0.2.0", "0.1.9"));
+        assert!(!is_newer_version("1.0.0", "v1.0.0"));
+        assert!(!is_newer_version("0.1.0", "0.0.9"));
+    }
+
+    #[test]
+    fn database_backup_works() {
+        let temp_dir = std::env::temp_dir().join(format!("test_token_scope_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let db_path = temp_dir.join(DATABASE_FILE);
+        std::fs::write(&db_path, b"test sqlite backup content").expect("write test db");
+
+        let backup_path = backup_database_file(&temp_dir).expect("backup database");
+        assert!(backup_path.exists());
+        let backup_content = std::fs::read(&backup_path).expect("read backup file");
+        assert_eq!(backup_content, b"test sqlite backup content");
+
+        let bak_path = temp_dir.join("token-statistics.sqlite.bak");
+        assert!(bak_path.exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
