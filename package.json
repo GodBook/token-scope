@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "test": "vitest run",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "sync-local": "cmd /c scripts\\update-local.bat"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

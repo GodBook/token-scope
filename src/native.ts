@@ -43,6 +43,7 @@ export type UpdateInfo = {
   assetName?: string | null;
   assetSize?: number | null;
   releaseUrl: string;
+  isLocalUpdate?: boolean;
 };
 
 export type DownloadProgress = {
@@ -62,6 +63,8 @@ export type AppMetadata = {
   appDataDir: string;
   databasePath: string;
   backupCount: number;
+  currentExePath?: string;
+  localProjectPath?: string | null;
 };
 
 export const nativeCheckAppUpdate = async (): Promise<UpdateInfo> => {

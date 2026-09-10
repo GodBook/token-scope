@@ -2169,7 +2169,7 @@ function UpdateModal({
             <div style={{ color: "var(--amber)" }}>
               <RefreshCw size={22} className="spin" />
             </div>
-            <span>正在连接 GitHub 检查最新版本...</span>
+            <span>正在扫描本地工程文件与更新状态...</span>
           </div>
         )}
 
@@ -2177,12 +2177,17 @@ function UpdateModal({
           <div className="update-status-card">
             <div className="update-tag-line">
               <span className="badge-latest">✓ 当前已是最新版</span>
-              <span>v{updateInfo.currentVersion} 暂无可用新版本</span>
+              <span>{updateInfo.releaseName || "已与本地工程保持最新"}</span>
             </div>
-            <div style={{ fontSize: 11, color: "var(--muted)", lineHeight: 1.5 }}>
-              {updateInfo.releaseNotes || "您正在使用的是最新发布的版本，本地数据库与历史记录完好无损。"}
+            <div style={{ fontSize: 11, color: "var(--muted)", lineHeight: 1.5, whiteSpace: "pre-line" }}>
+              {updateInfo.releaseNotes || "当前运行的程序已是最新构建版本，本地数据库与历史记录完好无损。"}
             </div>
-            {updateInfo.releaseUrl && (
+            {updateInfo.isLocalUpdate && appInfo?.localProjectPath && (
+              <div style={{ fontSize: 10, color: "var(--subtle)", marginTop: 6 }}>
+                本地工程路径：{appInfo.localProjectPath}
+              </div>
+            )}
+            {!updateInfo.isLocalUpdate && updateInfo.releaseUrl && (
               <div style={{ paddingTop: 4 }}>
                 <a
                   href={updateInfo.releaseUrl}
@@ -2202,25 +2207,26 @@ function UpdateModal({
         {updateInfo && updateInfo.hasUpdate && (
           <div className="update-status-card has-update">
             <div className="update-tag-line">
-              <span className="badge-new">发现新版本</span>
+              <span className="badge-new">{updateInfo.isLocalUpdate ? "本地有更新" : "发现新版本"}</span>
               <span>
-                v{updateInfo.latestVersion}{" "}
-                {updateInfo.releaseName ? `· ${updateInfo.releaseName}` : ""}
+                {updateInfo.releaseName || updateInfo.latestVersion}
               </span>
             </div>
 
             {updateInfo.releaseDate && (
               <div style={{ fontSize: 10, color: "var(--subtle)" }}>
-                发布日期：{updateInfo.releaseDate.slice(0, 10)}
+                构建/更新时间：{updateInfo.releaseDate}
               </div>
             )}
 
             {updateInfo.releaseNotes && (
               <div>
                 <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 4 }}>
-                  更新说明：
+                  版本与工程状态：
                 </div>
-                <div className="update-notes-box">{updateInfo.releaseNotes}</div>
+                <div className="update-notes-box" style={{ whiteSpace: "pre-line" }}>
+                  {updateInfo.releaseNotes}
+                </div>
               </div>
             )}
 
@@ -2229,7 +2235,7 @@ function UpdateModal({
               <div>
                 <strong>数据安全保证（不删除任何数据）</strong>
                 <span>
-                  本次升级采用无损更新机制，SQLite 历史数据存放在系统 AppData 目录，不受程序替换影响；启动安装前系统还将自动建立数据库备份快照。
+                  本次升级采用无损更新机制，SQLite 历史数据存放在系统 AppData 目录，不受程序替换影响；启动更新前系统还将自动建立带时间戳的完整快照备份。
                 </span>
               </div>
             </div>
@@ -2237,7 +2243,7 @@ function UpdateModal({
             {downloading && progress && (
               <div className="update-progress-bar-wrap">
                 <div className="update-progress-text">
-                  <span>正在下载更新包...</span>
+                  <span>{updateInfo.isLocalUpdate ? "正在同步更新..." : "正在下载更新包..."}</span>
                   <span>{progress.percentage.toFixed(1)}%</span>
                 </div>
                 <div className="update-progress-bar">
@@ -2247,12 +2253,12 @@ function UpdateModal({
                   />
                 </div>
                 <div className="update-progress-text" style={{ fontSize: 9 }}>
-                  <span>已下载 {(progress.downloaded / 1024 / 1024).toFixed(2)} MB</span>
+                  <span>已处理 {(progress.downloaded / 1024 / 1024).toFixed(2)} MB</span>
                   <span>
                     总计{" "}
                     {progress.total > 0
                       ? `${(progress.total / 1024 / 1024).toFixed(2)} MB`
-                      : "计算中"}
+                      : "完成"}
                   </span>
                 </div>
               </div>
@@ -2283,7 +2289,13 @@ function UpdateModal({
                   >
                     <HardDriveDownload size={15} />
                     <span>
-                      {downloading ? "正在下载更新包..." : "一键点击更新（无损保留数据）"}
+                      {downloading
+                        ? "正在更新..."
+                        : updateInfo.downloadUrl === "local://build_and_sync"
+                        ? "一键本地编译并热更新（无损保留数据）"
+                        : updateInfo.isLocalUpdate
+                        ? "一键应用本地更新（无损保留数据）"
+                        : "一键点击更新（无损保留数据）"}
                     </span>
                   </button>
                 ) : (
@@ -2295,10 +2307,10 @@ function UpdateModal({
                     style={{ flex: 1, textDecoration: "none", height: 38 }}
                   >
                     <ExternalLink size={14} />
-                    <span>前往 GitHub Release 页面下载</span>
+                    <span>前往发布页面查看</span>
                   </a>
                 )}
-                {updateInfo.downloadUrl && (
+                {!updateInfo.isLocalUpdate && updateInfo.downloadUrl && (
                   <a
                     href={updateInfo.releaseUrl}
                     target="_blank"

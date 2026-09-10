@@ -160,6 +160,7 @@ pub struct UpdateInfo {
     pub asset_name: Option<String>,
     pub asset_size: Option<u64>,
     pub release_url: String,
+    pub is_local_update: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -185,6 +186,8 @@ pub struct AppMetadata {
     pub app_data_dir: String,
     pub database_path: String,
     pub backup_count: usize,
+    pub current_exe_path: String,
+    pub local_project_path: Option<String>,
 }
 
 fn parse_version_digits(v: &str) -> Vec<u64> {
@@ -925,6 +928,91 @@ mod commands {
         size: u64,
     }
 
+    fn format_system_time(time: std::time::SystemTime) -> String {
+        let dt: chrono::DateTime<chrono::Local> = time.into();
+        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+
+    fn find_local_project_dir() -> Option<std::path::PathBuf> {
+        // 1. 优先检查本地固定路径
+        let fixed = std::path::PathBuf::from(r"D:\CHATGPT\token统计器");
+        if fixed.join("src-tauri").join("Cargo.toml").exists() {
+            return Some(fixed);
+        }
+
+        // 2. 检查环境变量
+        if let Ok(env_path) = std::env::var("TOKEN_SCOPE_PROJECT_DIR") {
+            let p = std::path::PathBuf::from(env_path);
+            if p.join("src-tauri").join("Cargo.toml").exists() {
+                return Some(p);
+            }
+        }
+
+        // 3. 从当前运行的 exe 向上追溯查找
+        if let Ok(current_exe) = std::env::current_exe() {
+            let mut cur = current_exe.parent();
+            while let Some(dir) = cur {
+                if dir.join("src-tauri").join("Cargo.toml").exists() {
+                    return Some(dir.to_path_buf());
+                }
+                let sibling = dir.join("token统计器");
+                if sibling.join("src-tauri").join("Cargo.toml").exists() {
+                    return Some(sibling);
+                }
+                cur = dir.parent();
+            }
+        }
+
+        None
+    }
+
+    fn get_latest_source_mtime(project_dir: &std::path::Path) -> Option<std::time::SystemTime> {
+        let mut latest: Option<std::time::SystemTime> = None;
+        let targets = [
+            project_dir.join("src"),
+            project_dir.join("src-tauri").join("src"),
+            project_dir.join("src-tauri").join("Cargo.toml"),
+            project_dir.join("package.json"),
+        ];
+
+        for target in &targets {
+            if target.is_file() {
+                if let Ok(meta) = std::fs::metadata(target) {
+                    if let Ok(mtime) = meta.modified() {
+                        latest = Some(latest.map_or(mtime, |prev| prev.max(mtime)));
+                    }
+                }
+            } else if target.is_dir() {
+                let mut stack = vec![target.clone()];
+                while let Some(dir) = stack.pop() {
+                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                        for entry in entries.filter_map(|e| e.ok()) {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                let name = entry.file_name();
+                                let s = name.to_string_lossy();
+                                if s != "target" && s != "node_modules" && s != ".git" {
+                                    stack.push(path);
+                                }
+                            } else if path.is_file() {
+                                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                                if matches!(ext, "rs" | "tsx" | "ts" | "css" | "json" | "html" | "toml") {
+                                    if let Ok(meta) = entry.metadata() {
+                                        if let Ok(mtime) = meta.modified() {
+                                            latest = Some(latest.map_or(mtime, |prev| prev.max(mtime)));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        latest
+    }
+
     async fn check_update_via_atom(
         client: &reqwest::Client,
         current_version: &str,
@@ -948,6 +1036,7 @@ mod commands {
                 asset_name: None,
                 asset_size: None,
                 release_url: "https://github.com/GodBook/token-scope/releases".to_string(),
+                is_local_update: false,
             });
         }
 
@@ -984,19 +1073,131 @@ mod commands {
             asset_name: Some(asset_name),
             asset_size: None,
             release_url: format!("https://github.com/GodBook/token-scope/releases/tag/{tag}"),
+            is_local_update: false,
         })
     }
 
     #[tauri::command]
     pub async fn check_app_update(app: tauri::AppHandle) -> AppResult<UpdateInfo> {
         let current_version = app.package_info().version.to_string();
+
+        // 1. 本地更新优先检查（完全脱机，免联网，秒级响应）
+        if let Some(project_dir) = find_local_project_dir() {
+            if let Ok(current_exe) = std::env::current_exe() {
+                let current_mtime = std::fs::metadata(&current_exe)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                let current_mtime_str = format_system_time(current_mtime);
+
+                let local_release_exe = project_dir
+                    .join("src-tauri")
+                    .join("target")
+                    .join("release")
+                    .join("token-scope.exe");
+
+                let is_same_file = match (current_exe.canonicalize(), local_release_exe.canonicalize()) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                };
+
+                // 检查已构建的新程序
+                let (has_compiled_update, local_mtime_str, local_size) = if local_release_exe.exists() {
+                    let meta = std::fs::metadata(&local_release_exe).ok();
+                    let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+                    let size = meta.as_ref().map(|m| m.len());
+                    let is_newer = if is_same_file {
+                        false
+                    } else if let (Some(l_time), c_time) = (mtime, current_mtime) {
+                        l_time > c_time + std::time::Duration::from_secs(2)
+                    } else {
+                        false
+                    };
+                    let m_str = mtime.map(format_system_time).unwrap_or_default();
+                    (is_newer, m_str, size)
+                } else {
+                    (false, String::new(), None)
+                };
+
+                // 检查源码是否有新修改
+                let source_mtime = get_latest_source_mtime(&project_dir);
+                let is_source_newer = if let (Some(s_time), c_time) = (source_mtime, current_mtime) {
+                    s_time > c_time + std::time::Duration::from_secs(2)
+                } else {
+                    false
+                };
+                let source_mtime_str = source_mtime.map(format_system_time).unwrap_or_default();
+
+                if has_compiled_update {
+                    let size_mb = local_size.unwrap_or(0) as f64 / (1024.0 * 1024.0);
+                    return Ok(UpdateInfo {
+                        has_update: true,
+                        current_version: format!("v{current_version} ({current_mtime_str})"),
+                        latest_version: format!("本地编译完成 ({local_mtime_str})"),
+                        release_name: "检测到本地工程已构建最新版本".to_string(),
+                        release_notes: format!(
+                            "本地工程路径：{}\n最新程序构建时间：{}\n文件大小：{:.2} MB\n\n点击【一键应用本地更新】，系统将自动备份数据库，并无损热替换为本地最新版本重新启动，无需联网。",
+                            project_dir.display(),
+                            local_mtime_str,
+                            size_mb
+                        ),
+                        release_date: local_mtime_str,
+                        download_url: Some(local_release_exe.to_string_lossy().to_string()),
+                        asset_name: Some("TokenScope.exe".to_string()),
+                        asset_size: local_size,
+                        release_url: project_dir.display().to_string(),
+                        is_local_update: true,
+                    });
+                }
+
+                if is_source_newer {
+                    return Ok(UpdateInfo {
+                        has_update: true,
+                        current_version: format!("v{current_version} ({current_mtime_str})"),
+                        latest_version: format!("源码有新修改 ({source_mtime_str})"),
+                        release_name: "检测到本地源码有改动（待编译）".to_string(),
+                        release_notes: format!(
+                            "本地工程路径：{}\n代码最新修改时间：{}\n\n本地源码已发生变化，尚未编译为可执行文件。点击【一键本地编译并更新】，将自动备份数据并在后台完成增量编译与无损热重启。",
+                            project_dir.display(),
+                            source_mtime_str
+                        ),
+                        release_date: source_mtime_str,
+                        download_url: Some("local://build_and_sync".to_string()),
+                        asset_name: Some("build_and_sync".to_string()),
+                        asset_size: None,
+                        release_url: project_dir.display().to_string(),
+                        is_local_update: true,
+                    });
+                }
+
+                // 已是本地最新
+                return Ok(UpdateInfo {
+                    has_update: false,
+                    current_version: format!("v{current_version} ({current_mtime_str})"),
+                    latest_version: format!("v{current_version} ({current_mtime_str})"),
+                    release_name: "当前已是本地最新版本".to_string(),
+                    release_notes: format!(
+                        "当前运行程序已与本地工程源码及编译产物完全一致，无需更新。\n本地工程：{}\n运行程序：{}",
+                        project_dir.display(),
+                        current_exe.display()
+                    ),
+                    release_date: current_mtime_str,
+                    download_url: None,
+                    asset_name: None,
+                    asset_size: None,
+                    release_url: project_dir.display().to_string(),
+                    is_local_update: true,
+                });
+            }
+        }
+
+        // 2. 若未检测到本地工程，降级回退到网络检查
         let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             .timeout(std::time::Duration::from_secs(8))
             .build()
             .map_err(|e| AppError::new("NETWORK_ERROR", format!("创建请求客户端失败: {e}")))?;
 
-        // 1. 优先尝试请求 GitHub REST API
         let api_url = "https://api.github.com/repos/GodBook/token-scope/releases/latest";
         if let Ok(response) = client
             .get(api_url)
@@ -1016,6 +1217,7 @@ mod commands {
                     asset_name: None,
                     asset_size: None,
                     release_url: "https://github.com/GodBook/token-scope/releases".to_string(),
+                    is_local_update: false,
                 });
             }
 
@@ -1053,19 +1255,20 @@ mod commands {
                         asset_name,
                         asset_size,
                         release_url: release.html_url,
+                        is_local_update: false,
                     });
                 }
             }
         }
 
-        // 2. 若 API 遭遇无鉴权速率限制 (403) 或被阻断，自动降级至 Atom Feed 免鉴权通道
-        if let Some(info) = check_update_via_atom(&client, &current_version).await {
+        if let Some(mut info) = check_update_via_atom(&client, &current_version).await {
+            info.is_local_update = false;
             return Ok(info);
         }
 
         Err(AppError::new(
             "NETWORK_ERROR",
-            "无法连接 GitHub 检查更新，请检查网络或稍后重试",
+            "未能定位本地工程，且无法连接 GitHub 检查更新",
         ))
     }
 
@@ -1083,7 +1286,7 @@ mod commands {
             .app_data_dir()
             .map_err(|e| AppError::new("PATH_ERROR", e.to_string()))?;
 
-        // 1. 保障数据安全：更新前自动创建数据库完整快照
+        // 1. 保障数据安全：所有更新前自动创建数据库完整快照
         let backup_path = backup_database_file(&data_dir)?;
         let backup_info = if backup_path.exists() {
             format!("已自动创建数据快照备份至：{}", backup_path.display())
@@ -1091,7 +1294,122 @@ mod commands {
             "未检测到需要备份的历史数据".to_string()
         };
 
-        // 2. 准备下载目录与文件
+        // 2. 本地编译并同步更新模式 (download_url == "local://build_and_sync")
+        if download_url == "local://build_and_sync" {
+            if let Some(project_dir) = find_local_project_dir() {
+                let script_path = project_dir.join("scripts").join("update-local.bat");
+                if !script_path.exists() {
+                    let _ = std::fs::create_dir_all(project_dir.join("scripts"));
+                    let content = r#"@echo off
+chcp 65001 >nul
+title TokenScope 本地一键编译与热更新
+echo ====================================================
+echo  TokenScope 本地编译与无损热更新
+echo ====================================================
+echo 正在执行前端构建...
+cd /d "%~dp0\.."
+call npm run build
+if %ERRORLEVEL% NEQ 0 (
+    echo 前端构建失败，按任意键退出
+    pause
+    exit /b 1
+)
+echo 正在执行 Rust 核心编译...
+call cargo build --release --manifest-path "src-tauri/Cargo.toml"
+if %ERRORLEVEL% NEQ 0 (
+    echo Rust 核心构建失败，按任意键退出
+    pause
+    exit /b 1
+)
+echo 正在安全更新可执行文件...
+copy /y "src-tauri\target\release\token-scope.exe" "..\TokenScope-绿色免安装版\TokenScope.exe" >nul
+echo 正在重新启动 TokenScope...
+start "" "..\TokenScope-绿色免安装版\TokenScope.exe"
+exit 0
+"#;
+                    let _ = std::fs::write(&script_path, content);
+                }
+
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = std::process::Command::new("cmd")
+                        .args(["/c", "start", "", script_path.to_str().unwrap_or_default()])
+                        .spawn();
+                    app.exit(0);
+                }
+
+                return Ok("已启动本地编译更新程序，请稍候...".to_string());
+            }
+        }
+
+        // 3. 本地已编译可执行文件直接热替换 (download_url 为本地路径)
+        let is_local_file = !download_url.starts_with("http://") && !download_url.starts_with("https://");
+        if is_local_file {
+            let source_exe = std::path::PathBuf::from(&download_url);
+            if !source_exe.exists() {
+                return Err(AppError::new(
+                    "FILE_NOT_FOUND",
+                    format!("本地源文件不存在: {}", source_exe.display()),
+                ));
+            }
+
+            let current_exe = std::env::current_exe()
+                .map_err(|e| AppError::new("PATH_ERROR", format!("获取当前程序路径失败: {e}")))?;
+
+            let is_same = match (current_exe.canonicalize(), source_exe.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            };
+
+            if is_same {
+                return Ok("当前运行的文件已是最新构建文件，无需重复替换。".to_string());
+            }
+
+            let _ = app.emit(
+                "update-download-progress",
+                DownloadProgress {
+                    percentage: 50.0,
+                    downloaded: 1,
+                    total: 2,
+                },
+            );
+
+            // Windows 热替换：重命名当前 running exe -> 复制新 exe -> 唤起新 exe -> 退出当前进程
+            let old_exe = current_exe.with_extension("exe.old");
+            if old_exe.exists() {
+                let _ = std::fs::remove_file(&old_exe);
+            }
+
+            std::fs::rename(&current_exe, &old_exe)
+                .map_err(|e| AppError::new("RENAME_ERROR", format!("重命名原程序文件失败: {e}")))?;
+
+            if let Err(e) = std::fs::copy(&source_exe, &current_exe) {
+                let _ = std::fs::rename(&old_exe, &current_exe);
+                return Err(AppError::new("COPY_ERROR", format!("复制新版本文件失败: {e}")));
+            }
+
+            let _ = app.emit(
+                "update-download-progress",
+                DownloadProgress {
+                    percentage: 100.0,
+                    downloaded: 2,
+                    total: 2,
+                },
+            );
+
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new(&current_exe).spawn();
+                app.exit(0);
+            }
+
+            return Ok(format!(
+                "本地更新已就绪并重启！{}\n您的所有历史 Token 数据均已完好保留。",
+                backup_info
+            ));
+        }
+
+        // 4. 远程网络下载回退逻辑
         let update_dir = std::env::temp_dir().join("token-scope-update");
         std::fs::create_dir_all(&update_dir)
             .map_err(|e| AppError::new("FS_ERROR", format!("创建下载目录失败: {e}")))?;
@@ -1147,7 +1465,6 @@ mod commands {
         file.flush()
             .map_err(|e| AppError::new("FS_ERROR", format!("写入磁盘失败: {e}")))?;
 
-        // 3. 启动安装程序（Windows 环境下保留 AppData 用户数据无损更新）
         #[cfg(target_os = "windows")]
         {
             if asset_name.ends_with(".msi") {
@@ -1207,11 +1524,18 @@ mod commands {
             0
         };
 
+        let current_exe_path = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let local_project_path = find_local_project_dir().map(|p| p.display().to_string());
+
         Ok(AppMetadata {
             version,
             app_data_dir: data_dir.display().to_string(),
             database_path: db_path.display().to_string(),
             backup_count,
+            current_exe_path,
+            local_project_path,
         })
     }
 }
@@ -1233,6 +1557,15 @@ pub fn run() {
                 Box::new(std::io::Error::other(error.message)) as Box<dyn std::error::Error>
             })?;
             app.manage(database);
+
+            // 清理可能遗留的历史更新旧文件
+            if let Ok(current_exe) = std::env::current_exe() {
+                let old_exe = current_exe.with_extension("exe.old");
+                if old_exe.exists() {
+                    let _ = std::fs::remove_file(old_exe);
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
