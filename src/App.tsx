@@ -451,7 +451,7 @@ function App() {
             onClick={() => setUpdateModalOpen(true)}
             title="点击检查更新"
           >
-            <span>v0.1.0 · Windows 桌面版</span>
+            <span>v1.0.0 · Windows 桌面版</span>
             {hasNewVersion ? (
               <span className="update-dot" title="有新版本可用" />
             ) : (
@@ -475,6 +475,15 @@ function App() {
             <strong>{navItems.find((item) => item.id === view)?.label}</strong>
           </div>
           <div className="topbar-actions">
+            <button
+              className="icon-button"
+              aria-label="设置与更新"
+              title="设置与更新"
+              onClick={() => setUpdateModalOpen(true)}
+            >
+              <Settings size={18} />
+              {hasNewVersion && <span className="topbar-update-dot" />}
+            </button>
             <button
               className="icon-button"
               aria-label="帮助"
@@ -754,9 +763,15 @@ function DashboardView({
     }),
     [stats.daily, displayTokenUnit],
   );
+  const isRotated = stats.byModel.length > 4;
   const barOption = useMemo<echarts.EChartsOption>(
     () => ({
-      grid: { top: 34, right: 16, bottom: 28, left: 48 },
+      grid: {
+        top: 32,
+        right: 16,
+        bottom: isRotated ? 58 : 28,
+        left: 48,
+      },
       tooltip: {
         trigger: "axis",
         axisPointer: { type: "shadow" },
@@ -767,18 +782,27 @@ function DashboardView({
           const point = Array.isArray(params)
             ? (params[0] as { name: string; value: number })
             : (params as { name: string; value: number });
-          return `<strong>${point.name}</strong><br/>${formatTokenValue(point.value, displayTokenUnit)} tokens`;
+          const percent =
+            stats.total > 0
+              ? ((point.value / stats.total) * 100).toFixed(1)
+              : "0.0";
+          return `<strong>${point.name}</strong><br/>${formatTokenValue(point.value, displayTokenUnit)} tokens · ${percent}%`;
         },
       },
       xAxis: {
         type: "category",
         data: stats.byModel.map((item) => item.name),
+        axisTick: { alignWithLabel: true },
         axisLabel: {
           color: "#8692a3",
-          fontSize: 11,
+          fontSize: isRotated ? 10 : 11,
           interval: 0,
+          rotate: isRotated ? 35 : 0,
+          align: isRotated ? "right" : "center",
+          verticalAlign: isRotated ? "middle" : "top",
+          margin: isRotated ? 10 : 8,
           formatter: (value: string) =>
-            value.length > 8 ? `${value.slice(0, 8)}…` : value,
+            value.length > 12 ? `${value.slice(0, 11)}…` : value,
         },
         axisLine: { lineStyle: { color: "#d8dee8" } },
       },
@@ -795,7 +819,14 @@ function DashboardView({
       series: [
         {
           type: "bar",
-          barMaxWidth: 32,
+          barMaxWidth: 30,
+          barCategoryGap: "25%",
+          emphasis: {
+            itemStyle: {
+              shadowBlur: 8,
+              shadowColor: "rgba(0, 0, 0, 0.15)",
+            },
+          },
           label: {
             show: true,
             position: "top",
@@ -808,7 +839,7 @@ function DashboardView({
               return formatTokenValue(point.value, displayTokenUnit, true);
             },
           },
-          labelLayout: { hideOverlap: false },
+          labelLayout: { hideOverlap: true },
           data: stats.byModel.map((item) => ({
             value: item.tokens,
             itemStyle: { color: item.color, borderRadius: [4, 4, 0, 0] },
@@ -816,7 +847,7 @@ function DashboardView({
         },
       ],
     }),
-    [stats.byModel, displayTokenUnit],
+    [stats.byModel, stats.total, displayTokenUnit, isRotated],
   );
   const donutOption = useMemo<echarts.EChartsOption>(
     () => ({
@@ -2130,7 +2161,7 @@ function UpdateModal({
               当前运行版本
             </div>
             <div className="version-badge">
-              TokenScope v{appInfo?.version || "0.1.0"}
+              TokenScope v{appInfo?.version || "1.0.0"}
             </div>
           </div>
           <button

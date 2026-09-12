@@ -74,8 +74,8 @@ export const nativeCheckAppUpdate = async (): Promise<UpdateInfo> => {
       if (res.status === 404) {
         return {
           hasUpdate: false,
-          currentVersion: "0.1.0",
-          latestVersion: "0.1.0",
+          currentVersion: "1.0.0",
+          latestVersion: "1.0.0",
           releaseName: "暂无发布记录",
           releaseNotes: "当前 GitHub 仓库尚未创建任何 Release 发布版本。",
           releaseDate: "",
@@ -87,9 +87,9 @@ export const nativeCheckAppUpdate = async (): Promise<UpdateInfo> => {
         const tag = (data.tag_name || "").replace(/^[vV]/, "");
         const asset = data.assets?.find((a: { name: string }) => a.name.endsWith(".exe") || a.name.endsWith(".msi")) || data.assets?.[0];
         return {
-          hasUpdate: tag !== "0.1.0" && tag !== "",
-          currentVersion: "0.1.0",
-          latestVersion: tag || "0.1.0",
+          hasUpdate: tag !== "1.0.0" && tag !== "",
+          currentVersion: "1.0.0",
+          latestVersion: tag || "1.0.0",
           releaseName: data.name || data.tag_name || "最新版本",
           releaseNotes: data.body || "",
           releaseDate: data.published_at || "",
@@ -104,8 +104,8 @@ export const nativeCheckAppUpdate = async (): Promise<UpdateInfo> => {
     }
     return {
       hasUpdate: false,
-      currentVersion: "0.1.0",
-      latestVersion: "0.1.0",
+      currentVersion: "1.0.0",
+      latestVersion: "1.0.0",
       releaseName: "当前版本已是最新",
       releaseNotes: "当前运行在浏览器预览模式下。",
       releaseDate: "",
@@ -133,7 +133,7 @@ export const nativeBackupDatabaseNow = async (): Promise<BackupResult> => {
 export const nativeGetAppInfo = async (): Promise<AppMetadata> => {
   if (!isNativeDesktop()) {
     return {
-      version: "0.1.0",
+      version: "1.0.0",
       appDataDir: "浏览器本地环境 (localStorage)",
       databasePath: "localStorage:token_scope_data",
       backupCount: 0,
