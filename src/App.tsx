@@ -3,6 +3,7 @@ import * as echarts from "echarts";
 import {
   BarChart3,
   CalendarDays,
+  Camera,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -24,6 +25,7 @@ import {
   Settings,
   ShieldCheck,
   SlidersHorizontal,
+  Sparkles,
   Sun,
   Trash2,
   Upload,
@@ -50,6 +52,10 @@ import {
 } from "./data";
 import { exportWorkbook } from "./export";
 import {
+  parseOcrResults,
+  type ParsedOcrRecord,
+} from "./ocrParser";
+import {
   isNativeDesktop,
   listenUpdateProgress,
   loadNativeData,
@@ -60,6 +66,7 @@ import {
   nativeDeleteRecord,
   nativeDownloadAndInstallUpdate,
   nativeGetAppInfo,
+  nativeRecognizeOcr,
   nativeSaveRecord,
   nativeSaveUsageRecordsBatch,
   nativeSetModelActive,
@@ -160,10 +167,39 @@ function App() {
     record?: UsageRecord;
   } | null>(null);
   const [modelModal, setModelModal] = useState<{ model?: Model } | null>(null);
+  const [ocrModalOpen, setOcrModalOpen] = useState(false);
+  const [ocrInitialImage, setOcrInitialImage] = useState<string | null>(null);
   const [updateModalOpen, setUpdateModalOpen] = useState(false);
   const [hasNewVersion, setHasNewVersion] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
+
+  useEffect(() => {
+    const handleGlobalPaste = (event: ClipboardEvent) => {
+      const items = event.clipboardData?.items;
+      if (!items) return;
+      for (const item of items) {
+        if (item.type.startsWith("image/")) {
+          const blob = item.getAsFile();
+          if (blob) {
+            event.preventDefault();
+            const reader = new FileReader();
+            reader.onload = (e) => {
+              const base64 = e.target?.result as string;
+              if (base64) {
+                setOcrInitialImage(base64);
+                setOcrModalOpen(true);
+              }
+            };
+            reader.readAsDataURL(blob);
+            break;
+          }
+        }
+      }
+    };
+    window.addEventListener("paste", handleGlobalPaste);
+    return () => window.removeEventListener("paste", handleGlobalPaste);
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -355,6 +391,25 @@ function App() {
     setModelModal(null);
     setToast("模型信息已保存");
   };
+  const handleCreateNewModel = async (model: Model): Promise<Model> => {
+    let finalModel = model;
+    if (isNativeDesktop()) {
+      try {
+        const created = await nativeCreateModel(model);
+        finalModel = { ...model, id: created.id };
+      } catch (err) {
+        console.warn("Failed to create model in local DB:", err);
+      }
+    }
+    setData((current) => ({
+      ...current,
+      models: [
+        ...current.models.filter((m) => m.id !== finalModel.id),
+        finalModel,
+      ],
+    }));
+    return finalModel;
+  };
   const handleDeleteModel = async (model: Model, recordCount: number) => {
     if (recordCount > 0) {
       setToast("模型已有历史记录，不能删除，请改用停用");
@@ -451,7 +506,7 @@ function App() {
             onClick={() => setUpdateModalOpen(true)}
             title="点击检查更新"
           >
-            <span>v1.0.0 · Windows 桌面版</span>
+            <span>v1.1.0 · Windows 桌面版</span>
             {hasNewVersion ? (
               <span className="update-dot" title="有新版本可用" />
             ) : (
@@ -523,6 +578,10 @@ function App() {
             displayTokenUnit={displayTokenUnit}
             setDisplayTokenUnit={setDisplayTokenUnit}
             onNew={() => setRecordModal({})}
+            onOcr={() => {
+              setOcrInitialImage(null);
+              setOcrModalOpen(true);
+            }}
             onExport={handleExport}
             exporting={exporting}
           />
@@ -535,6 +594,10 @@ function App() {
             query={query}
             setQuery={setQuery}
             onNew={() => setRecordModal({})}
+            onOcr={() => {
+              setOcrInitialImage(null);
+              setOcrModalOpen(true);
+            }}
             onEdit={(record) => setRecordModal({ record })}
             onDelete={handleDelete}
             onExport={handleExport}
@@ -588,6 +651,21 @@ function App() {
           models={data.models.filter((model) => model.active)}
           onClose={() => setRecordModal(null)}
           onSave={handleSaveRecord}
+          onCreateModel={handleCreateNewModel}
+        />
+      )}
+      {ocrModalOpen && (
+        <OcrImportModal
+          models={data.models}
+          records={data.records}
+          initialImage={ocrInitialImage}
+          onClose={() => {
+            setOcrModalOpen(false);
+            setOcrInitialImage(null);
+          }}
+          onBatchSave={handleBatchImport}
+          onCreateModel={handleCreateNewModel}
+          onToast={setToast}
         />
       )}
       {modelModal && (
@@ -629,6 +707,7 @@ function DashboardView({
   displayTokenUnit,
   setDisplayTokenUnit,
   onNew,
+  onOcr,
   onExport,
   exporting,
 }: {
@@ -644,6 +723,7 @@ function DashboardView({
   displayTokenUnit: DisplayTokenUnit;
   setDisplayTokenUnit: (unit: DisplayTokenUnit) => void;
   onNew: () => void;
+  onOcr?: () => void;
   onExport: () => void;
   exporting: boolean;
 }) {
@@ -906,6 +986,16 @@ function DashboardView({
             <Download size={16} />
             {exporting ? "导出中" : "导出 Excel"}
           </button>
+          {onOcr && (
+            <button
+              className="button secondary"
+              onClick={onOcr}
+              title="通过截图自动识别模型名称与用量"
+            >
+              <Camera size={16} />
+              OCR 识图填入
+            </button>
+          )}
           <button className="button primary" onClick={onNew}>
             <Plus size={17} />
             新增记录
@@ -1253,6 +1343,7 @@ function RecordsView({
   query,
   setQuery,
   onNew,
+  onOcr,
   onEdit,
   onDelete,
   onExport,
@@ -1264,6 +1355,7 @@ function RecordsView({
   query: string;
   setQuery: (value: string) => void;
   onNew: () => void;
+  onOcr?: () => void;
   onEdit: (record: UsageRecord) => void;
   onDelete: (record: UsageRecord) => void;
   onExport: () => void;
@@ -1286,6 +1378,16 @@ function RecordsView({
             <Download size={16} />
             {exporting ? "导出中" : "导出当前结果"}
           </button>
+          {onOcr && (
+            <button
+              className="button secondary"
+              onClick={onOcr}
+              title="通过截图自动识别模型名称与用量"
+            >
+              <Camera size={16} />
+              OCR 识图录入
+            </button>
+          )}
           <button className="button primary" onClick={onNew}>
             <Plus size={17} />
             新增记录
@@ -1865,16 +1967,643 @@ function BatchImportModal({
   );
 }
 
+function OcrImportModal({
+  models,
+  records,
+  initialImage,
+  onClose,
+  onBatchSave,
+  onCreateModel,
+  onToast,
+}: {
+  models: Model[];
+  records: UsageRecord[];
+  initialImage?: string | null;
+  onClose: () => void;
+  onBatchSave: (records: UsageRecord[], overwrite: boolean) => Promise<void>;
+  onCreateModel: (model: Model) => Promise<Model>;
+  onToast: (msg: string) => void;
+}) {
+  const [image, setImage] = useState<string | null>(initialImage ?? null);
+  const [recognizing, setRecognizing] = useState(false);
+  const [parsedRecords, setParsedRecords] = useState<ParsedOcrRecord[]>([]);
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [conflictMode, setConflictMode] = useState<"accumulate" | "overwrite" | "skip">("accumulate");
+  const [zoomImage, setZoomImage] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const runOcr = async (base64: string) => {
+    setImage(base64);
+    setRecognizing(true);
+    setError("");
+    try {
+      const lines = await nativeRecognizeOcr(base64);
+      const results = parseOcrResults(lines, models, todayString());
+      if (results.length === 0) {
+        setError(
+          "未能从截图中检测出模型名称或 Token 数量。请确保截图包含模型名（如 gpt-6-astra、gemini-3.8-flash）及数字用量。",
+        );
+      }
+      setParsedRecords(results);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(msg || "截图 OCR 识别失败，请检查图片或重试");
+    } finally {
+      setRecognizing(false);
+    }
+  };
+
+  useEffect(() => {
+    if (initialImage) {
+      runOcr(initialImage);
+    }
+  }, [initialImage]);
+
+  useEffect(() => {
+    const handlePaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const item of items) {
+        if (item.type.startsWith("image/")) {
+          const blob = item.getAsFile();
+          if (blob) {
+            e.preventDefault();
+            const reader = new FileReader();
+            reader.onload = (event) => {
+              const base64 = event.target?.result as string;
+              if (base64) runOcr(base64);
+            };
+            reader.readAsDataURL(blob);
+            break;
+          }
+        }
+      }
+    };
+    window.addEventListener("paste", handlePaste);
+    return () => window.removeEventListener("paste", handlePaste);
+  }, [models]);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const base64 = event.target?.result as string;
+      if (base64) runOcr(base64);
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (!file || !file.type.startsWith("image/")) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const base64 = event.target?.result as string;
+      if (base64) runOcr(base64);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const updateRecord = (id: string, partial: Partial<ParsedOcrRecord>) => {
+    setParsedRecords((prev) =>
+      prev.map((r) => (r.id === id ? { ...r, ...partial } : r)),
+    );
+  };
+
+  const removeRecord = (id: string) => {
+    setParsedRecords((prev) => prev.filter((r) => r.id !== id));
+  };
+
+  const addManualRecord = () => {
+    setParsedRecords((prev) => [
+      ...prev,
+      {
+        id: `ocr-${Date.now()}-${prev.length + 1}`,
+        selected: true,
+        date: todayString(),
+        modelName: models[0]?.name || "自定义模型",
+        matchedModelId: models[0]?.id || null,
+        isNewModel: !models.length,
+        suggestedProvider: models[0]?.provider || "自定义",
+        tokens: 10000,
+        notes: "",
+      },
+    ]);
+  };
+
+  const selectedRecords = parsedRecords.filter((r) => r.selected);
+  const totalTokens = selectedRecords.reduce((sum, r) => sum + (r.tokens || 0), 0);
+
+  const duplicateCount = selectedRecords.filter((item) => {
+    const mId = item.matchedModelId;
+    if (!mId) return false;
+    return records.some((r) => r.date === item.date && r.modelId === mId);
+  }).length;
+
+  const handleSave = async () => {
+    if (selectedRecords.length === 0) {
+      setError("请至少勾选一条要导入的记录");
+      return;
+    }
+    const invalid = selectedRecords.find(
+      (r) => !r.date || (!r.matchedModelId && !r.modelName.trim()) || r.tokens <= 0,
+    );
+    if (invalid) {
+      setError("请确保已选记录的日期、模型名称和 Token 数量均有效");
+      return;
+    }
+
+    setSaving(true);
+    setError("");
+    try {
+      const colors = ["#e5a84b", "#5bb9a4", "#7986e8", "#e57f74", "#ae79c7", "#66a9ce"];
+      const createdModelsMap = new Map<string, string>();
+      const batch: UsageRecord[] = [];
+
+      for (const item of selectedRecords) {
+        let modelId = item.matchedModelId;
+        if (!modelId) {
+          const trimName = item.modelName.trim();
+          if (createdModelsMap.has(trimName)) {
+            modelId = createdModelsMap.get(trimName)!;
+          } else {
+            const color = colors[models.length % colors.length];
+            const newModel = await onCreateModel({
+              id: makeId("model"),
+              name: trimName,
+              provider: item.suggestedProvider.trim() || "自定义",
+              color,
+              active: true,
+              createdAt: new Date().toISOString(),
+            });
+            createdModelsMap.set(trimName, newModel.id);
+            modelId = newModel.id;
+          }
+        }
+
+        const targetDate = item.date || todayString();
+        const existingRecord = records.find(
+          (r) => r.date === targetDate && r.modelId === modelId,
+        );
+
+        if (existingRecord) {
+          if (conflictMode === "skip") {
+            continue;
+          } else if (conflictMode === "accumulate") {
+            const combinedTokens = existingRecord.tokens + item.tokens;
+            let combinedNotes = item.notes.trim();
+            if (existingRecord.notes) {
+              combinedNotes = combinedNotes
+                ? `${existingRecord.notes}；${combinedNotes}`
+                : existingRecord.notes;
+            }
+            batch.push({
+              id: existingRecord.id,
+              date: targetDate,
+              modelId,
+              tokens: combinedTokens,
+              notes: combinedNotes,
+              createdAt: existingRecord.createdAt,
+            });
+            continue;
+          }
+        }
+
+        batch.push({
+          id: existingRecord ? existingRecord.id : makeId("ocr-record"),
+          date: targetDate,
+          modelId,
+          tokens: item.tokens,
+          notes: item.notes.trim(),
+          createdAt: existingRecord ? existingRecord.createdAt : new Date().toISOString(),
+        });
+      }
+
+      if (batch.length === 0) {
+        setError("所有选中的记录均存在冲突并被跳过，未导入任何记录");
+        setSaving(false);
+        return;
+      }
+
+      await onBatchSave(batch, true);
+      onToast(
+        conflictMode === "accumulate" && duplicateCount > 0
+          ? `已成功导入并累加 ${batch.length} 条用量记录`
+          : conflictMode === "skip" && duplicateCount > 0
+            ? `已成功导入 ${batch.length} 条记录（跳过 ${duplicateCount} 条冲突）`
+            : `成功通过 OCR 识别保存 ${batch.length} 条用量记录`
+      );
+      onClose();
+    } catch (caught: unknown) {
+      const appError = caught as { code?: string; message?: string };
+      setError(appError.message || "批量保存失败，请重试");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal title="OCR 截图自动识别用量" onClose={onClose} className="ocr-modal">
+      <div className="ocr-modal-body">
+        {!image ? (
+          <div
+            className={`ocr-dropzone ${isDragOver ? "dragover" : ""}`}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setIsDragOver(true);
+            }}
+            onDragLeave={() => setIsDragOver(false)}
+            onDrop={handleDrop}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              style={{ display: "none" }}
+              onChange={handleFileChange}
+            />
+            <div className="ocr-dropzone-icon">
+              <Camera size={24} />
+            </div>
+            <div className="ocr-dropzone-title">
+              点击选择图片，或将截图拖拽到此处
+            </div>
+            <div className="ocr-dropzone-desc">
+              支持截屏后直接按 <span className="ocr-dropzone-keys">Ctrl + V</span> 粘贴 · 自动识别模型名与用量，日期默认当天
+            </div>
+          </div>
+        ) : (
+          <div className="ocr-preview-header">
+            <div className="ocr-preview-thumb-wrap">
+              <div
+                className="ocr-preview-thumb-click"
+                onClick={() => setZoomImage(true)}
+                title="点击查看全景大图"
+              >
+                <img src={image} alt="截图预览" className="ocr-preview-thumb" />
+                <div className="ocr-preview-zoom-hint">全景大图</div>
+              </div>
+              <div>
+                <div className="ocr-preview-info">已载入截图</div>
+                <div className="ocr-preview-sub">
+                  {recognizing
+                    ? "正在进行智能识别..."
+                    : `识别完成 · 共匹配 ${parsedRecords.length} 条数据`}
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              className="button secondary small"
+              onClick={() => {
+                setImage(null);
+                setParsedRecords([]);
+                setError("");
+              }}
+            >
+              重新上传 / 粘贴
+            </button>
+          </div>
+        )}
+
+        {recognizing && (
+          <div className="ocr-loading-box">
+            <RefreshCw size={18} className="spin" style={{ color: "var(--amber)" }} />
+            <span>本地离线 OCR 正在识别模型名称与用量...</span>
+          </div>
+        )}
+
+        {error && <div className="form-error">{error}</div>}
+
+        {parsedRecords.length > 0 && (
+          <>
+            <div className="ocr-summary-bar">
+              <div className="ocr-summary-badges">
+                <span className="ocr-badge info">
+                  已识别 {parsedRecords.length} 条
+                </span>
+                <span className="ocr-badge success">
+                  已选 {selectedRecords.length} 条 · 共 {formatNumber(totalTokens)} Tokens
+                </span>
+                <span className="ocr-badge">
+                  日期默认当天: {todayString()}
+                </span>
+              </div>
+              <div className="ocr-actions-group">
+                <button
+                  type="button"
+                  className="ocr-toggle-link"
+                  onClick={() =>
+                    setParsedRecords((prev) => prev.map((r) => ({ ...r, selected: true })))
+                  }
+                >
+                  全选
+                </button>
+                <span className="ocr-action-divider">|</span>
+                <button
+                  type="button"
+                  className="ocr-toggle-link"
+                  onClick={() =>
+                    setParsedRecords((prev) => prev.map((r) => ({ ...r, selected: !r.selected })))
+                  }
+                >
+                  反选
+                </button>
+                {parsedRecords.some((r) => r.isNewModel) && (
+                  <>
+                    <span className="ocr-action-divider">|</span>
+                    <button
+                      type="button"
+                      className="ocr-toggle-link"
+                      onClick={() =>
+                        setParsedRecords((prev) =>
+                          prev.map((r) => ({ ...r, selected: r.isNewModel }))
+                        )
+                      }
+                    >
+                      仅选新模型
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            <div className="ocr-table-wrap">
+              <table className="ocr-table">
+                <thead>
+                  <tr>
+                    <th className="ocr-col-check">选</th>
+                    <th className="ocr-col-date">使用日期</th>
+                    <th className="ocr-col-model">模型</th>
+                    <th className="ocr-col-tokens">Token 数量</th>
+                    <th className="ocr-col-notes">备注 / 费用</th>
+                    <th className="ocr-col-action">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {parsedRecords.map((item) => (
+                    <tr
+                      key={item.id}
+                      className={item.selected ? "" : "unselected"}
+                    >
+                      <td className="ocr-col-check">
+                        <input
+                          type="checkbox"
+                          checked={item.selected}
+                          onChange={(e) =>
+                            updateRecord(item.id, {
+                              selected: e.target.checked,
+                            })
+                          }
+                        />
+                      </td>
+                      <td className="ocr-col-date">
+                        <input
+                          type="date"
+                          value={item.date}
+                          onChange={(e) =>
+                            updateRecord(item.id, { date: e.target.value })
+                          }
+                        />
+                      </td>
+                      <td className="ocr-col-model">
+                        {item.isNewModel ? (
+                          <div className="ocr-model-creator">
+                            <span className="ocr-badge new-model">
+                              ✨ 新模型 (自动新建)
+                            </span>
+                            <div className="ocr-model-creator-inputs">
+                              <input
+                                value={item.modelName}
+                                onChange={(e) =>
+                                   updateRecord(item.id, {
+                                    modelName: e.target.value,
+                                  })
+                                }
+                                placeholder="模型名称"
+                              />
+                              <input
+                                value={item.suggestedProvider}
+                                onChange={(e) =>
+                                  updateRecord(item.id, {
+                                    suggestedProvider: e.target.value,
+                                  })
+                                }
+                                placeholder="供应商"
+                                style={{ width: "90px" }}
+                              />
+                            </div>
+                            {models.length > 0 && (
+                              <button
+                                type="button"
+                                className="ocr-toggle-link"
+                                onClick={() =>
+                                  updateRecord(item.id, {
+                                    isNewModel: false,
+                                    matchedModelId: models[0]?.id || null,
+                                  })
+                                }
+                              >
+                                选择已有模型
+                              </button>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="ocr-model-selector">
+                            <select
+                              value={item.matchedModelId || ""}
+                              onChange={(e) => {
+                                const found = models.find(
+                                  (m) => m.id === e.target.value,
+                                );
+                                updateRecord(item.id, {
+                                  matchedModelId: e.target.value,
+                                  modelName: found?.name || item.modelName,
+                                });
+                              }}
+                            >
+                              {models.map((m) => (
+                                <option key={m.id} value={m.id}>
+                                  {m.name} · {m.provider}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              className="ocr-toggle-link"
+                              onClick={() =>
+                                updateRecord(item.id, {
+                                  isNewModel: true,
+                                  matchedModelId: null,
+                                })
+                              }
+                            >
+                              作为新模型创建
+                            </button>
+                          </div>
+                        )}
+                      </td>
+                      <td className="ocr-col-tokens">
+                        <input
+                          type="number"
+                          value={item.tokens || ""}
+                          onChange={(e) =>
+                            updateRecord(item.id, {
+                              tokens: parseInt(e.target.value, 10) || 0,
+                            })
+                          }
+                        />
+                        <span className="ocr-input-sub">
+                          {formatNumber(item.tokens)} Tokens
+                        </span>
+                      </td>
+                      <td className="ocr-col-notes">
+                        <input
+                          value={item.notes}
+                          onChange={(e) =>
+                            updateRecord(item.id, { notes: e.target.value })
+                          }
+                          placeholder="备注或费用"
+                        />
+                      </td>
+                      <td className="ocr-col-action">
+                        <button
+                          type="button"
+                          className="icon-button small danger"
+                          onClick={() => removeRecord(item.id)}
+                          title="移除此项"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "flex-start" }}>
+              <button
+                type="button"
+                className="button secondary small"
+                onClick={addManualRecord}
+              >
+                <Plus size={14} /> 添加一行
+              </button>
+            </div>
+          </>
+        )}
+
+        {duplicateCount > 0 && (
+          <div className="ocr-conflict-box">
+            <div className="ocr-conflict-header">
+              <CircleHelp size={16} />
+              <span>
+                检测到 <strong>{duplicateCount}</strong> 条记录在相同日期已有同模型历史数据，请选择处理方式：
+              </span>
+            </div>
+            <div className="ocr-conflict-options">
+              <button
+                type="button"
+                className={`ocr-conflict-btn ${conflictMode === "accumulate" ? "active" : ""}`}
+                onClick={() => setConflictMode("accumulate")}
+              >
+                ➕ 累加用量 (追加合并)
+              </button>
+              <button
+                type="button"
+                className={`ocr-conflict-btn ${conflictMode === "overwrite" ? "active" : ""}`}
+                onClick={() => setConflictMode("overwrite")}
+              >
+                🔄 覆盖更新 (替换旧值)
+              </button>
+              <button
+                type="button"
+                className={`ocr-conflict-btn ${conflictMode === "skip" ? "active" : ""}`}
+                onClick={() => setConflictMode("skip")}
+              >
+                ⏭️ 跳过冲突 (仅录全新)
+              </button>
+            </div>
+            <div className="ocr-conflict-tip">
+              {conflictMode === "accumulate" && "💡 累加模式：新识别的 Token 数值将加到已有记录上（适合分时多次统计）。"}
+              {conflictMode === "overwrite" && "💡 覆盖模式：直接以本次识别的新数值与备注替换历史记录。"}
+              {conflictMode === "skip" && "💡 跳过模式：忽略这几条冲突记录，仅保存其它未冲突的新条目。"}
+            </div>
+          </div>
+        )}
+
+        <div className="modal-actions">
+          <button
+            type="button"
+            className="button secondary"
+            onClick={onClose}
+            disabled={saving}
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            className="button primary"
+            onClick={handleSave}
+            disabled={saving || selectedRecords.length === 0}
+          >
+            {saving
+              ? "正在保存..."
+              : duplicateCount > 0
+                ? conflictMode === "accumulate"
+                  ? `确认累加并保存 (${selectedRecords.length} 条)`
+                  : conflictMode === "overwrite"
+                    ? `确认覆盖并保存 (${selectedRecords.length} 条)`
+                    : `跳过冲突并保存 (${selectedRecords.length - duplicateCount} 条)`
+                : `一键保存到记录 (${selectedRecords.length} 条)`}
+          </button>
+        </div>
+
+        {zoomImage && image && (
+          <div className="ocr-zoom-overlay" onClick={() => setZoomImage(false)}>
+            <div className="ocr-zoom-dialog" onClick={(e) => e.stopPropagation()}>
+              <div className="ocr-zoom-header">
+                <span>截图全景原图核对</span>
+                <button
+                  type="button"
+                  className="icon-button"
+                  onClick={() => setZoomImage(false)}
+                  title="关闭"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+              <div className="ocr-zoom-body">
+                <img src={image} alt="全景截图" className="ocr-zoom-img" />
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
 function RecordModal({
   record,
   models,
   onClose,
   onSave,
+  onCreateModel,
 }: {
   record?: UsageRecord;
   models: Model[];
   onClose: () => void;
   onSave: (record: UsageRecord, overwrite: boolean) => boolean;
+  onCreateModel?: (model: Model) => Promise<Model>;
 }) {
   const [date, setDate] = useState(record?.date ?? todayString());
   const [modelId, setModelId] = useState(
@@ -1885,6 +2614,83 @@ function RecordModal({
   const [notes, setNotes] = useState(record?.notes ?? "");
   const [error, setError] = useState("");
   const [overwrite, setOverwrite] = useState(false);
+  const [quickOcrLoading, setQuickOcrLoading] = useState(false);
+  const quickFileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleQuickOcr = async (base64: string) => {
+    setQuickOcrLoading(true);
+    setError("");
+    try {
+      const lines = await nativeRecognizeOcr(base64);
+      const parsed = parseOcrResults(lines, models, todayString());
+      if (parsed.length > 0) {
+        const first = parsed[0];
+        setDate(first.date);
+        if (first.matchedModelId) {
+          setModelId(first.matchedModelId);
+        } else if (onCreateModel) {
+          const colors = ["#e5a84b", "#5bb9a4", "#7986e8", "#e57f74", "#ae79c7", "#66a9ce"];
+          const created = await onCreateModel({
+            id: makeId("model"),
+            name: first.modelName,
+            provider: first.suggestedProvider || "自定义",
+            color: colors[models.length % colors.length],
+            active: true,
+            createdAt: new Date().toISOString(),
+          });
+          setModelId(created.id);
+        }
+        setTokens(String(first.tokens));
+        setUnit("1");
+        if (first.notes) {
+          setNotes(first.notes);
+        }
+      } else {
+        setError("未能从截图中识别出用量数据，请重试或手动输入");
+      }
+    } catch {
+      setError("OCR 识别失败，请检查图片或手动输入");
+    } finally {
+      setQuickOcrLoading(false);
+    }
+  };
+
+  const handleQuickFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const base64 = event.target?.result as string;
+      if (base64) handleQuickOcr(base64);
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  };
+
+  useEffect(() => {
+    const handlePasteInModal = (event: ClipboardEvent) => {
+      const items = event.clipboardData?.items;
+      if (!items) return;
+      for (const item of items) {
+        if (item.type.startsWith("image/")) {
+          const blob = item.getAsFile();
+          if (blob) {
+            event.preventDefault();
+            const reader = new FileReader();
+            reader.onload = (e) => {
+              const base64 = e.target?.result as string;
+              if (base64) handleQuickOcr(base64);
+            };
+            reader.readAsDataURL(blob);
+            break;
+          }
+        }
+      }
+    };
+    window.addEventListener("paste", handlePasteInModal);
+    return () => window.removeEventListener("paste", handlePasteInModal);
+  }, [models]);
+
   const submit = () => {
     const parsed = parseTokenInput(tokens, unit);
     if (!date || !modelId || !parsed) {
@@ -1910,6 +2716,28 @@ function RecordModal({
   return (
     <Modal title={record ? "编辑使用记录" : "新增使用记录"} onClose={onClose}>
       <div className="modal-form">
+        <div className="ocr-quick-bar">
+          <div className="ocr-quick-bar-left">
+            <Sparkles size={14} style={{ color: "var(--amber)" }} />
+            <span>支持 Ctrl+V 粘贴截图自动填入</span>
+          </div>
+          <input
+            ref={quickFileInputRef}
+            type="file"
+            accept="image/*"
+            style={{ display: "none" }}
+            onChange={handleQuickFile}
+          />
+          <button
+            type="button"
+            className="button secondary small"
+            onClick={() => quickFileInputRef.current?.click()}
+            disabled={quickOcrLoading}
+          >
+            <Camera size={13} />
+            {quickOcrLoading ? "识别中..." : "截图识图填入"}
+          </button>
+        </div>
         <label>
           使用日期
           <input

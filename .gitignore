@@ -12,7 +12,10 @@ dist
 dist-ssr
 src-tauri/target
 *.local
+*.traineddata
 TokenScope-绿色免安装版/
+*.exe
+*.zip
 
 # Editor directories and files
 .vscode/*

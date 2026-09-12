@@ -81,6 +81,23 @@ pub struct BatchUsageRecordInput {
     pub notes: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrWord {
+    pub text: String,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrLine {
+    pub text: String,
+    pub words: Vec<OcrWord>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageFilter {
@@ -1538,6 +1555,157 @@ exit 0
             local_project_path,
         })
     }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub fn recognize_image_ocr(image_data: String) -> AppResult<Vec<OcrLine>> {
+        #[cfg(target_os = "windows")]
+        {
+            use std::io::Write;
+            use std::os::windows::process::CommandExt;
+            use std::process::{Command, Stdio};
+
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            const OCR_SCRIPT: &str = r#"
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+Add-Type -AssemblyName System.Drawing
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+Function Await($WinRtTask, $ResultType) {
+    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $netTask.Wait(-1) | Out-Null
+    $netTask.Result
+}
+
+[Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime] | Out-Null
+[Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime] | Out-Null
+[Windows.Media.Ocr.OcrEngine, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
+[Windows.Globalization.Language, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
+
+$rawInput = [Console]::In.ReadToEnd()
+if ([string]::IsNullOrWhiteSpace($rawInput)) {
+    Write-Output "[]"
+    exit 0
+}
+
+$inputTrimmed = $rawInput.Trim()
+$tempFile = $null
+$needDelete = $false
+
+if ($inputTrimmed -like "PATH:*" -or (Test-Path $inputTrimmed -PathType Leaf 2>$null)) {
+    $tempFile = if ($inputTrimmed -like "PATH:*") { $inputTrimmed.Substring(5).Trim() } else { $inputTrimmed }
+} else {
+    $base64 = $rawInput -replace '^data:image\/[a-zA-Z0-9\+\-\.]+;base64,', ''
+    $base64 = $base64.Trim()
+    $memBytes = [System.Convert]::FromBase64String($base64)
+    $memStream = New-Object System.IO.MemoryStream(,$memBytes)
+    $origBmp = [System.Drawing.Bitmap]::FromStream($memStream)
+    $scale = 1.0
+    if ($origBmp.Width -lt 1000 -or $origBmp.Height -lt 400) {
+        $scale = 2.0
+    }
+    $bmpToProcess = $origBmp
+    if ($scale -ne 1.0) {
+        $newW = [int]($origBmp.Width * $scale)
+        $newH = [int]($origBmp.Height * $scale)
+        $scaledBmp = New-Object System.Drawing.Bitmap $newW, $newH
+        $g = [System.Drawing.Graphics]::FromImage($scaledBmp)
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $g.DrawImage($origBmp, 0, 0, $newW, $newH)
+        $g.Dispose()
+        $origBmp.Dispose()
+        $bmpToProcess = $scaledBmp
+    }
+    $outStream = New-Object System.IO.MemoryStream
+    $bmpToProcess.Save($outStream, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmpToProcess.Dispose()
+    $outBytes = $outStream.ToArray()
+    $outStream.Dispose()
+    $memStream.Dispose()
+
+    $tempFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "ts_ocr_" + [System.Guid]::NewGuid().ToString() + ".png")
+    [System.IO.File]::WriteAllBytes($tempFile, $outBytes)
+    $needDelete = $true
+}
+
+try {
+    $storageFile = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($tempFile)) ([Windows.Storage.StorageFile])
+    $fileStream = Await ($storageFile.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+    $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($fileStream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+    $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+
+    $lang = [Windows.Globalization.Language]::new("en-US")
+    $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($lang)
+    if ($null -eq $engine) {
+        $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+    }
+    $ocrResult = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+
+    $output = @()
+    foreach ($line in $ocrResult.Lines) {
+        $lineWords = @()
+        foreach ($w in $line.Words) {
+            $lineWords += @{
+                text = $w.Text
+                x = [int]($w.BoundingRect.X / $scale)
+                y = [int]($w.BoundingRect.Y / $scale)
+                w = [int]($w.BoundingRect.Width / $scale)
+                h = [int]($w.BoundingRect.Height / $scale)
+            }
+        }
+        $output += @{
+            text = $line.Text
+            words = $lineWords
+        }
+    }
+    $json = $output | ConvertTo-Json -Depth 5 -Compress
+    Write-Output $json
+} finally {
+    if ($needDelete -and [System.IO.File]::Exists($tempFile)) {
+        [System.IO.File]::Delete($tempFile)
+    }
+}
+"#;
+
+            let mut child = Command::new("powershell")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", OCR_SCRIPT])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| AppError::new("OCR_SPAWN_ERROR", format!("启动 OCR 进程失败: {e}")))?;
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(image_data.as_bytes())
+                    .map_err(|e| AppError::new("OCR_WRITE_ERROR", format!("写入图像数据失败: {e}")))?;
+            }
+
+            let output = child.wait_with_output()
+                .map_err(|e| AppError::new("OCR_WAIT_ERROR", format!("等待 OCR 进程结束失败: {e}")))?;
+
+            if !output.status.success() {
+                let err_msg = String::from_utf8_lossy(&output.stderr);
+                return Err(AppError::new("OCR_EXEC_ERROR", format!("OCR 识别出错: {err_msg}")));
+            }
+
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            let trimmed = stdout_str.trim();
+            if trimmed.is_empty() || trimmed == "[]" {
+                return Ok(vec![]);
+            }
+
+            let lines: Vec<OcrLine> = serde_json::from_str(trimmed)
+                .map_err(|e| AppError::new("OCR_PARSE_ERROR", format!("解析 OCR 结果 JSON 失败: {e} (输出: {trimmed})")))?;
+
+            Ok(lines)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = image_data;
+            Err(AppError::new("NOT_SUPPORTED", "原生 OCR 当前仅在 Windows 环境下原生支持"))
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1582,7 +1750,8 @@ pub fn run() {
             commands::check_app_update,
             commands::download_and_install_update,
             commands::backup_database_now,
-            commands::get_app_info
+            commands::get_app_info,
+            commands::recognize_image_ocr
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
